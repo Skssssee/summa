@@ -5,7 +5,7 @@ import json
 
 app = Flask(__name__)
 
-# --- 1. CONFIGURATION (Matching your working CLI) ---
+# --- 1. CONFIGURATION ---
 COOKIES = {
     "B": "f7bed719990fcc9630de8f7ca53fab9e",
     "CT": "OTkzNjc5NDEw",
@@ -68,7 +68,6 @@ HTML_TEMPLATE = """
         .song-info { flex: 1; overflow: hidden; }
         .song-info b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         
-        /* POPUP PLAYER */
         #popup { position: fixed; top: 100%; left: 0; width: 100%; height: 100%; background: linear-gradient(180deg, #333, #000); z-index: 1000; transition: 0.4s; padding: 40px 25px; box-sizing: border-box; text-align: center; }
         #popup.active { top: 0; }
         .p-img { width: 85%; border-radius: 15px; margin-top: 30px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
@@ -154,9 +153,10 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# --- 4. BACKEND ---
+# --- 4. BACKEND ROUTES ---
 @app.route('/')
-def home(): return render_template_string(HTML_TEMPLATE)
+def home(): 
+    return render_template_string(HTML_TEMPLATE)
 
 @app.route('/api/trending')
 def trending():
@@ -165,7 +165,12 @@ def trending():
     for sec in ['new_trending', 'charts', 'new_albums', 'top_playlists']:
         if sec in res:
             for item in res[sec]:
-                items.append({'title': clean_txt(item.get('title') or item.get('name')), 'type': item.get('type'), 'token': item.get('perma_url').split('/')[-1], 'image': item.get('image','').replace('150x150','500x500')})
+                items.append({
+                    'title': clean_txt(item.get('title') or item.get('name')), 
+                    'type': item.get('type'), 
+                    'token': item.get('perma_url').split('/')[-1], 
+                    'image': item.get('image','').replace('150x150','500x500')
+                })
     return jsonify(items)
 
 @app.route('/api/search')
@@ -174,13 +179,17 @@ def search():
     res = session.get(f"https://www.jiosaavn.com/api.php?__call=search.getResults&q={q}&api_version=4&_format=json").json()
     items = []
     for i in res.get('results', []):
-        items.append({'title': clean_txt(i.get('title')), 'type': i.get('type'), 'token': i.get('perma_url').split('/')[-1], 'image': i.get('image','').replace('150x150','500x500')})
+        items.append({
+            'title': clean_txt(i.get('title')), 
+            'type': i.get('type'), 
+            'token': i.get('perma_url').split('/')[-1], 
+            'image': i.get('image','').replace('150x150','500x500')
+        })
     return jsonify(items)
 
 @app.route('/api/details')
 def details():
     token = request.args.get('token')
-    # Use exact CLI call parameters
     url = f"https://www.jiosaavn.com/api.php?__call=webapi.get&token={token}&type=song&api_version=4&_format=json"
     res = session.get(url).json()
     song = res[0] if isinstance(res, list) else res.get('songs', [res])[0]
@@ -211,32 +220,36 @@ def playlist():
             sec = int(s.get('duration'))
             dur = f"{sec // 60}:{sec % 60:02d}"
         except: pass
-        songs.append({"song": clean_txt(s.get('song') or s.get('title')), "artist": clean_artists(s.get('primary_artists')), "image": s.get('image','').replace('150x150','500x500'), "token": s.get('perma_url').split('/')[-1], "duration": dur})
+        songs.append({
+            "song": clean_txt(s.get('song') or s.get('title')), 
+            "artist": clean_artists(s.get('primary_artists')), 
+            "image": s.get('image','').replace('150x150','500x500'), 
+            "token": s.get('perma_url').split('/')[-1], 
+            "duration": dur
+        })
     return jsonify(songs)
 
 @app.route('/api/download')
 def download():
     token = request.args.get('token')
-    # 1. Get metadata
     res = session.get(f"https://www.jiosaavn.com/api.php?__call=webapi.get&token={token}&type=song&api_version=4&_format=json").json()
     enc_url = find_key(res, "encrypted_media_url")
     
     if not enc_url:
         return jsonify({"url": None})
 
-    # 2. Try 320kbps (Exactly like your CLI)
+    # Generate Token
     auth_params = {"__call": "song.generateAuthToken", "url": enc_url, "bitrate": "320", "api_version": "4", "_format": "json"}
     auth_res = session.get("https://www.jiosaavn.com/api.php", params=auth_params).json()
     link = auth_res.get('auth_url')
     
-    # 3. Fallback to 128kbps if blocked
     if not link:
         auth_params["bitrate"] = "128"
         auth_res = session.get("https://www.jiosaavn.com/api.php", params=auth_params).json()
         link = auth_res.get('auth_url')
 
-    print(f"DEBUG: Token {token} Link -> {link}")
     return jsonify({"url": link})
 
-def handler(request, response):
-    return app
+# Vercel needs the app object, it doesn't run the __main__ block
+if __name__ == '__main__':
+    app.run(debug=True)
