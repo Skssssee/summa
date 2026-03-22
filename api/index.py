@@ -1,37 +1,42 @@
-from flask import Flask, jsonify, request, render_template_string, session
+from flask import Flask, jsonify, request, render_template_string, session, redirect, url_for
 import requests
 import firebase_admin
 from firebase_admin import credentials, db
-import json
+from werkzeug.security import generate_password_hash, check_password_hash
 import os
+import json
 
 app = Flask(__name__)
-app.secret_key = "misofy_secret_key" # Change this for production
+# Set a secret key for sessions - In production, use an environment variable
+app.secret_key = os.getenv("SESSION_KEY", "misofy_default_secret_123")
 
-# --- 1. FIREBASE & CONFIG ---
-# Initialize Firebase using your Realtime DB URL
+# --- 1. FIREBASE SETUP ---
 if not firebase_admin._apps:
-    cred = credentials.Certificate({
-        "project_id": "kodularlive",
-        "private_key": os.getenv("FIREBASE_PRIVATE_KEY", "").replace('\\n', '\n'),
-        "client_email": os.getenv("FIREBASE_CLIENT_EMAIL", "")
-    }) if os.getenv("FIREBASE_PRIVATE_KEY") else None
-    
-    # If deploying to Vercel, use the DB URL from your JSON
-    firebase_admin.initialize_app(cred, {
-        'databaseURL': 'https://kodularlive-default-rtdb.firebaseio.com'
-    })
+    # Use Environment Variable for Firebase Service Account JSON
+    fb_cred = os.getenv("FIREBASE_SERVICE_ACCOUNT")
+    if fb_cred:
+        cred = credentials.Certificate(json.loads(fb_cred))
+        firebase_admin.initialize_app(cred, {
+            'databaseURL': 'https://kodularlive-default-rtdb.firebaseio.com'
+        })
+    else:
+        # Fallback for local testing without credentials (will only work for public DBs)
+        firebase_admin.initialize_app(options={
+            'databaseURL': 'https://kodularlive-default-rtdb.firebaseio.com'
+        })
 
-COOKIES = {
+# JioSaavn Session
+s_node = requests.Session()
+s_node.cookies.update({
     "B": "f7bed719990fcc9630de8f7ca53fab9e",
     "CT": "OTkzNjc5NDEw",
     "geo": "2401%3A4900%3A88a3%3Ac407%3Ad1ba%3Ac7ef%3A6fcc%3A761b%2CIN%2CBihar%2CPatna%2C800001"
-}
-
-s_node = requests.Session()
-s_node.cookies.update(COOKIES)
+})
 
 # --- 2. HELPERS ---
+def clean_txt(t):
+    return t.replace("&quot;", '"').replace("&amp;", "&").replace("&#039;", "'").replace("&ndash;", "-") if t else ""
+
 def find_key(data, key):
     if isinstance(data, dict):
         if key in data: return data[key]
@@ -44,163 +49,167 @@ def find_key(data, key):
             if res: return res
     return None
 
-def clean_txt(t):
-    return t.replace("&quot;", '"').replace("&amp;", "&").replace("&#039;", "'").replace("&ndash;", "-") if t else ""
-
-# --- 3. UI TEMPLATE (With Google Login & Scroll Player) ---
+# --- 3. UI TEMPLATE ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Misofy | Premium</title>
+    <title>Misofy | Premium Music</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <script src="https://accounts.google.com/gsi/client" async defer></script>
     <style>
-        :root { --accent: #1db954; --bg: #000; --panel: #181818; }
+        :root { --accent: #1db954; --bg: #000; --panel: #121212; }
         body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: white; margin: 0; overflow-x: hidden; }
         .container { padding: 15px; max-width: 800px; margin: 0 auto; padding-bottom: 120px; }
         
-        /* Login Bar */
-        .user-bar { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; }
-        #user-info { display: flex; align-items: center; gap: 10px; font-size: 0.9rem; }
-        #user-info img { width: 30px; border-radius: 50%; }
+        .auth-overlay { position: fixed; inset: 0; background: var(--bg); z-index: 2000; display: flex; align-items: center; justify-content: center; padding: 20px; }
+        .auth-card { background: var(--panel); padding: 30px; border-radius: 20px; width: 100%; max-width: 380px; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+        input { width: 100%; padding: 14px; margin: 10px 0; border-radius: 10px; border: 1px solid #333; background: #1a1a1a; color: white; box-sizing: border-box; font-size: 1rem; }
+        .btn { background: var(--accent); color: black; border: none; padding: 14px; border-radius: 30px; font-weight: bold; cursor: pointer; width: 100%; margin-top: 15px; font-size: 1rem; }
+        .btn-alt { background: transparent; color: #888; border: none; margin-top: 20px; cursor: pointer; text-decoration: underline; }
+        
+        .nav { display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; }
+        .search-bar { display: flex; background: #222; padding: 12px 20px; border-radius: 30px; align-items: center; gap: 12px; margin-bottom: 20px; }
+        .search-bar input { margin: 0; padding: 0; border: none; background: transparent; font-size: 1rem; }
 
-        .search-box { display: flex; gap: 10px; background: #222; padding: 12px 15px; border-radius: 25px; margin: 15px 0; }
-        input { flex: 1; background: transparent; border: none; color: white; outline: none; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(145px, 1fr)); gap: 15px; }
+        .card { background: var(--panel); padding: 12px; border-radius: 15px; cursor: pointer; transition: 0.2s; }
+        .card:active { transform: scale(0.95); }
+        .card img { width: 100%; border-radius: 10px; aspect-ratio: 1/1; object-fit: cover; }
         
-        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 15px; }
-        .card { background: var(--panel); padding: 12px; border-radius: 12px; transition: 0.3s; }
-        .card img { width: 100%; border-radius: 8px; aspect-ratio: 1/1; object-fit: cover; }
-        
-        /* SCROLL PLAYER (Bottom Sheet) */
         #player-sheet { 
-            position: fixed; top: calc(100% - 80px); left: 0; width: 100%; height: 100%; 
-            background: linear-gradient(180deg, #222, #000); z-index: 1000; 
-            transition: transform 0.4s cubic-bezier(0.33, 1, 0.68, 1); 
-            border-radius: 20px 20px 0 0; box-shadow: 0 -5px 20px rgba(0,0,0,0.5);
+            position: fixed; bottom: 0; left: 0; width: 100%; height: 88vh; 
+            background: linear-gradient(180deg, #222 0%, #000 100%); 
+            z-index: 1000; transition: transform 0.5s cubic-bezier(0.3, 1, 0.4, 1);
+            transform: translateY(calc(100% - 80px)); border-radius: 25px 25px 0 0;
+            box-shadow: 0 -10px 30px rgba(0,0,0,0.8);
         }
-        #player-sheet.expanded { transform: translateY(calc(-100% + 80px)); }
+        #player-sheet.expanded { transform: translateY(0); }
         
-        /* Mini Player Part */
-        .mini-player { height: 80px; display: flex; align-items: center; padding: 0 20px; cursor: pointer; }
-        .mini-player img { width: 50px; height: 50px; border-radius: 5px; margin-right: 15px; }
+        .mini-p { height: 80px; display: flex; align-items: center; padding: 0 20px; cursor: pointer; }
+        .mini-p img { width: 50px; height: 50px; border-radius: 6px; margin-right: 15px; }
         
-        /* Full Player Part */
-        .full-content { padding: 40px 25px; text-align: center; opacity: 0; transition: 0.3s; pointer-events: none; }
-        #player-sheet.expanded .full-content { opacity: 1; pointer-events: all; }
-        .p-img { width: 80%; border-radius: 15px; margin: 20px 0; box-shadow: 0 10px 40px rgba(0,0,0,0.8); }
+        .full-p { padding: 40px 30px; text-align: center; display: none; }
+        #player-sheet.expanded .full-p { display: block; }
+        #player-sheet.expanded .mini-p { display: none; }
         
-        .controls { display: flex; justify-content: center; align-items: center; gap: 30px; margin-top: 20px; }
-        .stats { display: flex; justify-content: center; gap: 20px; margin: 15px 0; color: #888; font-size: 0.9rem; }
-        .like-btn.active { color: var(--accent); }
-        
-        .prog-bg { width: 100%; height: 6px; background: #444; border-radius: 3px; margin: 20px 0; cursor: pointer; }
+        .p-art { width: 85%; border-radius: 20px; margin: 20px auto; box-shadow: 0 15px 50px rgba(0,0,0,0.7); display: block; }
+        .prog-bg { width: 100%; height: 6px; background: #444; border-radius: 3px; margin: 30px 0 10px 0; cursor: pointer; }
         #prog { height: 100%; background: var(--accent); width: 0%; border-radius: 3px; }
+        
+        .controls { display: flex; justify-content: center; align-items: center; gap: 40px; margin-top: 30px; }
+        .active-heart { color: var(--accent); }
+        .hidden { display: none; }
     </style>
 </head>
 <body>
+    {% if not session.user %}
+    <div class="auth-overlay">
+        <div class="auth-card" id="login-form">
+            <h1 style="color:var(--accent); margin:0 0 10px 0">Misofy</h1>
+            <p style="color:#888">Login to listen</p>
+            <input type="text" id="l-user" placeholder="Username">
+            <input type="password" id="l-pass" placeholder="Password">
+            <button class="btn" onclick="auth('login')">Login</button>
+            <button class="btn-alt" onclick="toggleAuth(true)">Don't have an account? Register</button>
+        </div>
+        <div class="auth-card hidden" id="reg-form">
+            <h1 style="color:var(--accent); margin:0 0 10px 0">Sign Up</h1>
+            <p style="color:#888">Create your Misofy account</p>
+            <input type="text" id="r-user" placeholder="Username">
+            <input type="password" id="r-pass" placeholder="Password">
+            <button class="btn" onclick="auth('register')">Register</button>
+            <button class="btn-alt" onclick="toggleAuth(false)">Back to Login</button>
+        </div>
+    </div>
+    {% endif %}
+
     <div class="container">
-        <div class="user-bar">
-            <div style="font-size: 1.8rem; font-weight: 800; color: var(--accent);">Misofy</div>
-            <div id="user-info">
-                <div id="g_id_onload"
-                     data-client_id="808693598001-iom354vtrg0t7dft3055pholnrlqct7h.apps.googleusercontent.com"
-                     data-callback="handleAuth">
-                </div>
-                <div class="g_id_signin" data-type="standard"></div>
+        <div class="nav">
+            <div style="font-size: 1.8rem; font-weight: 900; color: var(--accent);">Misofy</div>
+            {% if session.user %}
+            <div style="font-size: 0.85rem; background: #222; padding: 5px 12px; border-radius: 15px;">
+                <b>{{ session.user }}</b> | <a href="/logout" style="color:var(--accent); text-decoration:none">Exit</a>
             </div>
+            {% endif %}
         </div>
 
-        <div class="search-box">
-            <input id="q" placeholder="Search Artists, Songs, Albums..." onkeypress="if(event.key=='Enter')search()">
-            <i class="fas fa-search" onclick="search()"></i>
+        <div class="search-bar">
+            <i class="fas fa-search" style="color:#666"></i>
+            <input id="q" placeholder="Search for songs..." onkeypress="if(event.key=='Enter')search()">
         </div>
+
         <div id="content" class="grid">Loading trending...</div>
     </div>
 
-    <div id="player-sheet">
-        <div class="mini-player" onclick="togglePlayer()">
+    <div id="player-sheet" onclick="if(!this.classList.contains('expanded')) togglePlayer(true)">
+        <div class="mini-p">
             <img id="m-img" src="https://via.placeholder.com/50">
             <div style="flex:1; overflow:hidden">
-                <b id="m-name" style="display:block; white-space:nowrap; text-overflow:ellipsis">Not Playing</b>
-                <small id="m-artist" style="color:#888">Select a song</small>
+                <b id="m-name" style="white-space:nowrap; display:block; overflow:hidden; text-overflow:ellipsis">Not Playing</b>
+                <small id="m-artist" style="color:#888">Select music</small>
             </div>
-            <i class="fas fa-play" id="m-play" style="font-size:1.5rem" onclick="event.stopPropagation();playPause()"></i>
+            <i class="fas fa-play" id="m-play" style="font-size:1.4rem" onclick="event.stopPropagation(); playPause()"></i>
         </div>
 
-        <div class="full-content">
-            <i class="fas fa-chevron-down" style="font-size:1.5rem; float:left" onclick="togglePlayer()"></i>
+        <div class="full-p">
+            <i class="fas fa-chevron-down" style="float:left; font-size:1.5rem" onclick="togglePlayer(false)"></i>
             <div style="clear:both"></div>
-            <img id="p-img" class="p-img">
+            <img id="p-img" class="p-art">
             <div style="text-align:left">
-                <h2 id="p-name" style="margin:0">Track Name</h2>
-                <p id="p-artist" style="color:#888">Artist Name</p>
+                <h2 id="p-name" style="margin:0; font-size:1.5rem">Track</h2>
+                <p id="p-artist" style="color:#888; font-size:1rem">Artist</p>
             </div>
-            
-            <div class="stats">
-                <span><i class="fas fa-headphones"></i> <span id="v-count">0</span> views</span>
-                <span onclick="toggleLike()" class="like-btn" id="l-btn"><i class="fas fa-heart"></i> Like</span>
+
+            <div style="display:flex; justify-content:space-between; color:#888; font-size:0.9rem; margin-top:20px">
+                <span><i class="fas fa-headphones"></i> <span id="v-count">0</span></span>
+                <span id="like-btn" onclick="toggleLike()" style="cursor:pointer"><i class="fas fa-heart"></i> Like</span>
             </div>
 
             <div class="prog-bg" onclick="seek(event)"><div id="prog"></div></div>
-            <div style="display:flex; justify-content:space-between; font-size:0.8rem; color:#888">
+            <div style="display:flex; justify-content:space-between; font-size:0.75rem; color:#666">
                 <span id="cur">0:00</span><span id="tot">0:00</span>
             </div>
 
             <div class="controls">
                 <i class="fas fa-backward-step" style="font-size:1.8rem"></i>
-                <i class="fas fa-circle-play" id="p-play" style="font-size:4rem" onclick="playPause()"></i>
+                <i class="fas fa-circle-play" id="p-play" style="font-size:4.5rem" onclick="playPause()"></i>
                 <i class="fas fa-forward-step" style="font-size:1.8rem"></i>
             </div>
-            <button onclick="dl()" style="margin-top:30px; background:transparent; border:1px solid #444; color:white; padding:10px 20px; border-radius:20px"><i class="fas fa-download"></i> Download</button>
         </div>
     </div>
 
     <audio id="aud" ontimeupdate="upd()"></audio>
 
     <script>
-        let curUser = null;
         let curToken = null;
-        let isExpanded = false;
-
-        // AUTH
-        function handleAuth(resp) {
-            const payload = JSON.parse(atob(resp.credential.split('.')[1]));
-            curUser = payload.sub;
-            document.getElementById('user-info').innerHTML = `<img src="${payload.picture}"> <span>${payload.given_name}</span>`;
+        function toggleAuth(reg) {
+            document.getElementById('login-form').classList.toggle('hidden', reg);
+            document.getElementById('reg-form').classList.toggle('hidden', !reg);
         }
-
-        function togglePlayer() {
-            isExpanded = !isExpanded;
-            document.getElementById('player-sheet').classList.toggle('expanded', isExpanded);
+        async function auth(type) {
+            const user = document.getElementById(type=='login'?'l-user':'r-user').value;
+            const pass = document.getElementById(type=='login'?'l-pass':'r-pass').value;
+            const res = await fetch(`/api/auth/${type}`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({user, pass})
+            });
+            const data = await res.json();
+            if(data.success) location.reload(); else alert(data.error);
         }
-
+        function togglePlayer(ex) { document.getElementById('player-sheet').classList.toggle('expanded', ex); }
         function load() { fetch('/api/trending').then(r=>r.json()).then(draw); }
         function search() { fetch(`/api/search?q=${document.getElementById('q').value}`).then(r=>r.json()).then(draw); }
-        
         function draw(d) {
             document.getElementById('content').innerHTML = d.map(i => `
-                <div class="card" onclick="openCol('${i.token}','${i.type}')">
+                <div class="card" onclick="play('${i.token}')">
                     <img src="${i.image}">
-                    <div style="margin-top:8px; font-weight:bold; font-size:0.9rem; overflow:hidden; white-space:nowrap; text-overflow:ellipsis">${i.title}</div>
+                    <div style="margin-top:10px; font-weight:bold; font-size:0.85rem; overflow:hidden; white-space:nowrap; text-overflow:ellipsis">${i.title}</div>
                 </div>
             `).join('');
         }
-
-        function openCol(t, y) {
-            if(y=='song') { play(t); return; }
-            fetch(`/api/playlist?token=${t}&type=${y}`).then(r=>r.json()).then(songs => {
-                document.getElementById('content').innerHTML = songs.map(s => `
-                    <div style="display:flex; align-items:center; gap:15px; padding:10px; border-bottom:1px solid #222" onclick="play('${s.token}')">
-                        <img src="${s.image}" style="width:40px; border-radius:4px">
-                        <div style="flex:1"><b>${s.song}</b><br><small style="color:#888">${s.artist}</small></div>
-                    </div>
-                `).join('');
-            });
-        }
-
         function play(t) {
             curToken = t;
             fetch(`/api/details?token=${t}`).then(r=>r.json()).then(s => {
@@ -208,45 +217,37 @@ HTML_TEMPLATE = """
                 document.getElementById('m-artist').innerText = document.getElementById('p-artist').innerText = s.artist;
                 document.getElementById('m-img').src = document.getElementById('p-img').src = s.image;
                 document.getElementById('tot').innerText = s.duration;
-                
-                // Fetch Stats
-                fetch(`/api/stats?token=${t}&uid=${curUser||'anon'}`).then(r=>r.json()).then(st => {
-                    document.getElementById('v-count').innerText = st.views;
-                    document.getElementById('l-btn').classList.toggle('active', st.liked);
+                fetch(`/api/stats?token=${t}`).then(r=>r.json()).then(st => {
+                    document.getElementById('v-count').innerText = st.views + " plays";
+                    document.getElementById('like-btn').className = st.liked ? 'active-heart' : '';
                 });
-
                 fetch(`/api/download?token=${t}`).then(r=>r.json()).then(d => {
-                    if(!d.url) return alert("Song unavailable");
+                    if(!d.url) return;
                     let a = document.getElementById('aud'); a.src = d.url; a.play();
                     document.getElementById('m-play').className = "fas fa-pause";
                     document.getElementById('p-play').className = "fas fa-circle-pause";
                 });
             });
         }
-
         function toggleLike() {
-            if(!curUser) return alert("Please login to like songs");
-            fetch(`/api/like?token=${curToken}&uid=${curUser}`).then(r=>r.json()).then(res => {
-                document.getElementById('l-btn').classList.toggle('active', res.status == 'liked');
+            fetch(`/api/like?token=${curToken}`).then(r=>r.json()).then(res => {
+                document.getElementById('like-btn').className = res.status == 'liked' ? 'active-heart' : '';
             });
         }
-
         function playPause() {
             let a = document.getElementById('aud');
             if(a.paused) a.play(); else a.pause();
-            let p = a.paused;
-            document.getElementById('m-play').className = p ? "fas fa-play" : "fas fa-pause";
-            document.getElementById('p-play').className = p ? "fas fa-circle-play" : "fas fa-circle-pause";
+            document.getElementById('m-play').className = a.paused ? "fas fa-play" : "fas fa-pause";
+            document.getElementById('p-play').className = a.paused ? "fas fa-circle-play" : "fas fa-circle-pause";
         }
-
         function upd() {
             let a = document.getElementById('aud');
+            if(!a.duration) return;
             document.getElementById('prog').style.width = (a.currentTime/a.duration*100)+"%";
             document.getElementById('cur').innerText = fmt(a.currentTime);
         }
         function fmt(s) { let m=Math.floor(s/60), sc=Math.floor(s%60); return m+":"+(sc<10?'0':'')+sc; }
         function seek(e) { let a = document.getElementById('aud'); a.currentTime = (e.offsetX/e.currentTarget.offsetWidth)*a.duration; }
-        
         load();
     </script>
 </body>
@@ -254,39 +255,58 @@ HTML_TEMPLATE = """
 """
 
 # --- 4. BACKEND LOGIC ---
-
 @app.route('/')
 def home():
     return render_template_string(HTML_TEMPLATE)
 
+@app.route('/api/auth/register', methods=['POST'])
+def register():
+    data = request.json
+    u, p = data.get('user'), data.get('pass')
+    if not u or not p: return jsonify({"error": "Missing fields"}), 400
+    ref = db.reference(f'users/{u}')
+    if ref.get(): return jsonify({"error": "User exists"}), 400
+    ref.set({"pass": generate_password_hash(p)})
+    session['user'] = u
+    return jsonify({"success": True})
+
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    data = request.json
+    u, p = data.get('user'), data.get('pass')
+    user_data = db.reference(f'users/{u}').get()
+    if user_data and check_password_hash(user_data['pass'], p):
+        session['user'] = u
+        return jsonify({"success": True})
+    return jsonify({"error": "Wrong credentials"}), 401
+
+@app.route('/logout')
+def logout():
+    session.pop('user', None)
+    return redirect(url_for('home'))
+
 @app.route('/api/stats')
-def get_stats():
+def stats():
     token = request.args.get('token')
-    uid = request.args.get('uid')
+    user = session.get('user')
     ref = db.reference(f'stats/{token}')
     data = ref.get() or {"views": 0, "likes": {}}
-    
-    # Increment views on load
     new_views = data.get('views', 0) + 1
     ref.update({"views": new_views})
-    
-    liked = False
-    if uid != 'anon' and 'likes' in data:
-        liked = uid in data['likes']
-        
+    liked = user in data.get('likes', {}) if user else False
     return jsonify({"views": new_views, "liked": liked})
 
 @app.route('/api/like')
-def toggle_like():
+def like():
+    user = session.get('user')
+    if not user: return jsonify({"error": "Login first"}), 401
     token = request.args.get('token')
-    uid = request.args.get('uid')
-    ref = db.reference(f'stats/{token}/likes/{uid}')
+    ref = db.reference(f'stats/{token}/likes/{user}')
     if ref.get():
         ref.delete()
         return jsonify({"status": "unliked"})
-    else:
-        ref.set(True)
-        return jsonify({"status": "liked"})
+    ref.set(True)
+    return jsonify({"status": "liked"})
 
 @app.route('/api/trending')
 def trending():
@@ -295,12 +315,45 @@ def trending():
     for sec in ['new_trending', 'charts', 'new_albums']:
         if sec in res:
             for i in res[sec]:
-                items.append({'title': clean_txt(i.get('title') or i.get('name')), 'type': i.get('type'), 'token': i.get('perma_url').split('/')[-1], 'image': i.get('image','').replace('150x150','500x500')})
+                items.append({
+                    'title': clean_txt(i.get('title') or i.get('name')), 
+                    'type': i.get('type'), 
+                    'token': i.get('perma_url').split('/')[-1], 
+                    'image': i.get('image','').replace('150x150','500x500')
+                })
     return jsonify(items)
 
-# Add your existing /api/search, /api/details, /api/playlist, /api/download here from the previous code...
-# (The logic remains the same as your CLI)
+@app.route('/api/search')
+def search():
+    q = request.args.get('q')
+    res = s_node.get(f"https://www.jiosaavn.com/api.php?__call=search.getResults&q={q}&api_version=4&_format=json").json()
+    items = []
+    for i in res.get('results', []):
+        items.append({'title': clean_txt(i.get('title')), 'type': i.get('type'), 'token': i.get('perma_url').split('/')[-1], 'image': i.get('image','').replace('150x150','500x500')})
+    return jsonify(items)
 
-if __name__ == '__main__':
-    app.run(debug=True)
-    
+@app.route('/api/details')
+def details():
+    token = request.args.get('token')
+    res = s_node.get(f"https://www.jiosaavn.com/api.php?__call=webapi.get&token={token}&type=song&api_version=4&_format=json").json()
+    song = res[0] if isinstance(res, list) else res.get('songs', [res])[0]
+    dur = int(find_key(song, "duration") or 0)
+    return jsonify({
+        "song": clean_txt(find_key(song, "song") or find_key(song, "title")),
+        "artist": clean_txt(find_key(song, "primary_artists")),
+        "image": find_key(song, "image").replace('150x150','500x500'),
+        "duration": f"{dur // 60}:{dur % 60:02d}"
+    })
+
+@app.route('/api/download')
+def download():
+    token = request.args.get('token')
+    res = s_node.get(f"https://www.jiosaavn.com/api.php?__call=webapi.get&token={token}&type=song&api_version=4&_format=json").json()
+    enc_url = find_key(res, "encrypted_media_url")
+    auth_params = {"__call": "song.generateAuthToken", "url": enc_url, "bitrate": "128", "api_version": "4", "_format": "json"}
+    auth_res = s_node.get("https://www.jiosaavn.com/api.php", params=auth_params).json()
+    return jsonify({"url": auth_res.get('auth_url')})
+
+# Vercel needs the app variable
+app = app
+                                                                  
